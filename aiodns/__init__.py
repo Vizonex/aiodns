@@ -4,6 +4,7 @@ import logging
 import socket
 import sys
 from collections.abc import Iterable, Sequence
+from types import TracebackType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -19,7 +20,7 @@ import pycares
 
 from . import error
 
-__version__ = '3.4.0'
+__version__ = '3.5.0'
 
 __all__ = ('DNSResolver', 'error')
 
@@ -31,9 +32,6 @@ WINDOWS_SELECTOR_ERR_MSG = (
 )
 
 _LOGGER = logging.getLogger(__name__)
-
-READ = 1
-WRITE = 2
 
 query_type_map = {
     'A': pycares.QUERY_TYPE_A,
@@ -66,6 +64,7 @@ class DNSResolver:
         loop: Optional[asyncio.AbstractEventLoop] = None,
         **kwargs: Any,
     ) -> None:  # TODO(PY311): Use Unpack for kwargs.
+        self._closed = True
         self.loop = loop or asyncio.get_event_loop()
         if TYPE_CHECKING:
             assert self.loop is not None
@@ -78,6 +77,7 @@ class DNSResolver:
         self._read_fds: set[int] = set()
         self._write_fds: set[int] = set()
         self._timer: Optional[asyncio.TimerHandle] = None
+        self._closed = False
 
     def _make_channel(self, **kwargs: Any) -> tuple[bool, pycares.Channel]:
         if (
@@ -268,10 +268,14 @@ class DNSResolver:
     def _sock_state_cb(self, fd: int, readable: bool, writable: bool) -> None:
         if readable or writable:
             if readable:
-                self.loop.add_reader(fd, self._handle_event, fd, READ)
+                self.loop.add_reader(
+                    fd, self._channel.process_fd, fd, pycares.ARES_SOCKET_BAD
+                )
                 self._read_fds.add(fd)
             if writable:
-                self.loop.add_writer(fd, self._handle_event, fd, WRITE)
+                self.loop.add_writer(
+                    fd, self._channel.process_fd, pycares.ARES_SOCKET_BAD, fd
+                )
                 self._write_fds.add(fd)
             if self._timer is None:
                 self._start_timer()
@@ -293,15 +297,6 @@ class DNSResolver:
                 self._timer.cancel()
                 self._timer = None
 
-    def _handle_event(self, fd: int, event: int) -> None:
-        read_fd = pycares.ARES_SOCKET_BAD
-        write_fd = pycares.ARES_SOCKET_BAD
-        if event == READ:
-            read_fd = fd
-        elif event == WRITE:
-            write_fd = fd
-        self._channel.process_fd(read_fd, write_fd)
-
     def _timer_cb(self) -> None:
         if self._read_fds or self._write_fds:
             self._channel.process_fd(
@@ -319,3 +314,55 @@ class DNSResolver:
             timeout = 0.1
 
         self._timer = self.loop.call_later(timeout, self._timer_cb)
+
+    def _cleanup(self) -> None:
+        """Cleanup timers and file descriptors when closing resolver."""
+        if self._closed:
+            return
+        # Mark as closed first to prevent double cleanup
+        self._closed = True
+        # Cancel timer if running
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+        # Remove all file descriptors
+        for fd in self._read_fds:
+            self.loop.remove_reader(fd)
+        for fd in self._write_fds:
+            self.loop.remove_writer(fd)
+
+        self._read_fds.clear()
+        self._write_fds.clear()
+        self._channel.close()
+
+    async def close(self) -> None:
+        """
+        Cleanly close the DNS resolver.
+
+        This should be called to ensure all resources are properly released.
+        After calling close(), the resolver should not be used again.
+        """
+        self._cleanup()
+
+    async def __aenter__(self) -> 'DNSResolver':
+        """Enter the async context manager."""
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> None:
+        """Exit the async context manager."""
+        await self.close()
+
+    def __del__(self) -> None:
+        """Handle cleanup when the resolver is garbage collected."""
+        # Check if we have a channel to clean up
+        # This can happen if an exception occurs during __init__ before
+        # _channel is created (e.g., RuntimeError on Windows
+        # without proper loop)
+        if hasattr(self, '_channel'):
+            self._cleanup()
